@@ -43,18 +43,25 @@ MODELS = [(BertForSequenceClassification,BertTokenizer,'bert-base-cased'),
           (AlbertForSequenceClassification, AlbertTokenizer,'albert-base-v1')
         ]
 
+LABEL_MAP = {'neutral': 0, 'positive': 1, 'negative': 2}
+
 def build_dataset(df, tokenizer):
     """
     Prepares the dataset for training or evaluation by tokenizing the text and creating attention masks.
+    String polarity labels are mapped to ids via LABEL_MAP; the input DataFrame is not modified.
 
     Args:
         df (pd.DataFrame): DataFrame containing the text data and labels.
         tokenizer (transformers.PreTrainedTokenizer): Tokenizer to use for encoding the text.
     """
-    labels = df['polarity']
-    
+    labels = df['polarity'].astype(str).str.strip().str.lower().map(LABEL_MAP)
+    if labels.isna().any():
+        unknown = sorted(df.loc[labels.isna(), 'polarity'].astype(str).unique())
+        raise ValueError(f"Unknown polarity labels {unknown}; expected one of {list(LABEL_MAP)}")
+    labels = labels.astype('int64')
+
     enc = tokenizer(
-        df['text'].tolist(),
+        df['text'].fillna('').astype(str).tolist(),
         truncation=True,
         padding='max_length',
         max_length=MAX_LEN,
@@ -85,8 +92,6 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
         str: The path where the best model was saved.
     """
     seed_torch(42)
-
-    train_df['polarity'] = train_df['polarity'].replace({'neutral': 0, 'positive': 1, 'negative': 2})
 
     tokenizer = model_tokenizer.from_pretrained(model_name, do_lower_case=True)
 
@@ -151,7 +156,8 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
     print(f"Using device: {device}")
 
     print("Starting training...")
-    best_f1 = 0
+    best_f1 = -1
+    best_val_labels, best_val_predictions = [], []
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
@@ -198,11 +204,12 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
 
         if val_f1 > best_f1:
             best_f1 = val_f1
+            best_val_labels, best_val_predictions = val_labels, val_predictions
             torch.save(model.state_dict(), model_save_path)
             print(f"Best model saved at {model_save_path}")
 
-    print("Final Model Performance on Validation Set:")
-    print(classification_report(val_labels, val_predictions, digits=4))
+    print("Best (Saved) Model Performance on Validation Set:")
+    print(classification_report(best_val_labels, best_val_predictions, digits=4, zero_division=0))
     return model_save_path
 
 def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model_name):
@@ -223,9 +230,6 @@ def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model
     """
     seed_torch(42)
 
-    # Replace sentiment labels with numeric values
-    test_df['polarity'] = test_df['polarity'].replace({'neutral': 0, 'positive': 1, 'negative': 2})
-
     tokenizer = model_tokenizer.from_pretrained(model_name, do_lower_case=True)
 
     # Tokenize the test data
@@ -234,7 +238,7 @@ def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model
 
     # Load the model
     model = model_task.from_pretrained(model_name, num_labels=3, ignore_mismatched_sizes=True)
-    model.load_state_dict(torch.load(model_saved_path))
+    model.load_state_dict(torch.load(model_saved_path, map_location=device))
     model.to(device)
     model.eval()
 
@@ -342,7 +346,8 @@ def predict_model(predict_df, model_saved_path, model_task, model_tokenizer, mod
 
     # Instantiate model dynamically
     model = model_task.from_pretrained(model_name, num_labels=3)
-    model.load_state_dict(torch.load(model_saved_path))
+    model.load_state_dict(torch.load(model_saved_path, map_location=device))
+    model.to(device)
     model.eval()
 
     predictions = []

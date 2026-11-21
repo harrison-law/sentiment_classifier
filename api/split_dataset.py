@@ -1,6 +1,6 @@
 import pandas as pd
 
-def split_dataset(df, val_frac=0.1, test_frac=0.2, gap=None):
+def split_dataset(df, val_frac=0.1, test_frac=0.2, gap=pd.Timedelta(0)):
     """
     Chronogolical train/validate/test split of a dataset.
 
@@ -8,7 +8,8 @@ def split_dataset(df, val_frac=0.1, test_frac=0.2, gap=None):
         df (pd.DataFrame): The input DataFrame to split.
         val_frac (float): Fraction of the dataset to use for validation.
         test_frac (float): Fraction of the dataset to use for testing.
-        gap (int, optional): Number of rows to skip between splits to avoid data leakage.
+        gap (pd.Timedelta, optional): Time span dropped just before the val and test
+            boundaries (by 'updated_at') to avoid data leakage between splits.
 
     Returns:
         tuple: Three DataFrames corresponding to the training, validation, and test sets.
@@ -30,7 +31,6 @@ def split_dataset(df, val_frac=0.1, test_frac=0.2, gap=None):
     # so rows sharing a timestamp can never straddle a boundary.
     val_start = df['updated_at'].iloc[int(n * (1 - val_frac - test_frac))]
     test_start = df['updated_at'].iloc[int(n * (1 - test_frac))]
-    gap = gap or pd.Timedelta(0)
 
     t = df['updated_at']
     train = df[t < val_start - gap]
