@@ -9,7 +9,7 @@ from torch.utils.data import TensorDataset, DataLoader, RandomSampler, Sequentia
 from io import StringIO
 from unicodedata import category
 from markdown import markdown
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score,classification_report
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, classification_report, confusion_matrix
 from torch.utils.data import DataLoader, RandomSampler
 from transformers import (
     BertTokenizer, BertForSequenceClassification, BertForMaskedLM,
@@ -68,7 +68,7 @@ def build_dataset(df, tokenizer):
         torch.tensor(labels.values)
     )
 
-def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, model_name):
+def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, model_name, history=None):
     """
     Trains a sentiment classification model on the provided dataset.
 
@@ -78,6 +78,8 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
         model_task (class): Transformer model class, e.g., AutoModelForSequenceClassification
         model_tokenizer (class): Tokenizer class, e.g., AutoTokenizer
         model_name (str): Hugging Face model name, e.g., "bert-base-cased"
+        history (list, optional): If given, one dict of per-epoch metrics
+            (epoch, train_loss, train_accuracy, val_accuracy, val_f1) is appended per epoch.
 
     Returns:
         str: The path where the best model was saved.
@@ -136,7 +138,7 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
     """
     
     # Use passed-in model_task and model_name
-    model = model_task.from_pretrained(model_name, num_labels=3)
+    model = model_task.from_pretrained(model_name, num_labels=3, ignore_mismatched_sizes=True)
     model.to(device)
 
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -185,6 +187,15 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
         val_f1 = f1_score(val_labels, val_predictions, average='weighted')
         print(f"Validation Accuracy: {val_acc:.4f}, F1 Score: {val_f1:.4f}")
 
+        if history is not None:
+            history.append({
+                "epoch": epoch + 1,
+                "train_loss": float(total_loss / len(train_dataloader)),
+                "train_accuracy": float(train_acc),
+                "val_accuracy": float(val_acc),
+                "val_f1": float(val_f1),
+            })
+
         if val_f1 > best_f1:
             best_f1 = val_f1
             torch.save(model.state_dict(), model_save_path)
@@ -193,6 +204,92 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
     print("Final Model Performance on Validation Set:")
     print(classification_report(val_labels, val_predictions, digits=4))
     return model_save_path
+
+def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model_name):
+    """
+    Evaluates a pre-trained sentiment classification model on a test dataset.
+
+    Args:
+        test_df (pd.DataFrame): DataFrame containing test data with 'text' and 'polarity' columns.
+        model_saved_path (str): Path to the saved model.
+        model_task (class): Transformer model class, e.g., AutoModelForSequenceClassification
+        model_tokenizer (class): Tokenizer class, e.g., AutoTokenizer
+        model_name (str): Hugging Face model name, e.g., "bert-base-cased"
+
+    Returns:
+        dict: JSON-serializable test metrics: weighted accuracy/precision/recall/f1,
+        class labels, a confusion matrix (rows = true, cols = predicted, in label
+        order), and per-class precision/recall/f1/support.
+    """
+    seed_torch(42)
+
+    # Replace sentiment labels with numeric values
+    test_df['polarity'] = test_df['polarity'].replace({'neutral': 0, 'positive': 1, 'negative': 2})
+
+    tokenizer = model_tokenizer.from_pretrained(model_name, do_lower_case=True)
+
+    # Tokenize the test data
+    test_data = build_dataset(test_df, tokenizer)
+    test_dataloader = DataLoader(test_data, sampler=SequentialSampler(test_data), batch_size=BATCH_SIZE)
+
+    # Load the model
+    model = model_task.from_pretrained(model_name, num_labels=3, ignore_mismatched_sizes=True)
+    model.load_state_dict(torch.load(model_saved_path))
+    model.to(device)
+    model.eval()
+
+    # Make predictions
+    predictions, true_labels = [], []
+    with torch.no_grad():
+        for batch in test_dataloader:
+            b_input_ids, b_input_mask, b_labels = [t.to(device) for t in batch]
+            outputs = model(b_input_ids, attention_mask=b_input_mask)
+            logits = outputs[0]
+            predictions.extend(torch.argmax(logits, axis=1).cpu().numpy())
+            true_labels.extend(b_labels.cpu().numpy())
+
+    # Calculate metrics
+    accuracy = accuracy_score(true_labels, predictions)
+    precision = precision_score(true_labels, predictions, average='weighted', zero_division=0)
+    recall = recall_score(true_labels, predictions, average='weighted', zero_division=0)
+    f1 = f1_score(true_labels, predictions, average='weighted', zero_division=0)
+    conf_matrix = confusion_matrix(true_labels, predictions, labels=[0, 1, 2])
+
+    # Print metrics
+    print("Evaluation Metrics:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print("Confusion Matrix:")
+    print(conf_matrix)
+
+    label_ids = [0, 1, 2]
+    label_names = ["neutral", "positive", "negative"]
+    report = classification_report(
+        true_labels, predictions, labels=label_ids,
+        target_names=label_names, output_dict=True, zero_division=0
+    )
+    per_class = [
+        {
+            "label": name,
+            "precision": float(report[name]["precision"]),
+            "recall": float(report[name]["recall"]),
+            "f1": float(report[name]["f1-score"]),
+            "support": int(report[name]["support"]),
+        }
+        for name in label_names
+    ]
+
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "labels": label_names,
+        "confusion_matrix": conf_matrix.astype(int).tolist(),
+        "per_class": per_class,
+    }
 
 def predict_model(predict_df, model_saved_path, model_task, model_tokenizer, model_name):
     """
