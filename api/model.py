@@ -18,7 +18,10 @@ from transformers import (
     AlbertTokenizer, AlbertForSequenceClassification, AlbertForMaskedLM,
     get_scheduler
 )
+from transformers.utils import logging as transformers_logging
 from torch.optim import AdamW
+
+from api.labels import LABELS, LABEL_IDS, LABEL_ORDER, to_text_labels
 
 MAX_LEN = 256
 BATCH_SIZE = 16
@@ -43,22 +46,16 @@ MODELS = [(BertForSequenceClassification,BertTokenizer,'bert-base-cased'),
           (AlbertForSequenceClassification, AlbertTokenizer,'albert-base-v1')
         ]
 
-LABEL_MAP = {'neutral': 0, 'positive': 1, 'negative': 2}
-
 def build_dataset(df, tokenizer):
     """
     Prepares the dataset for training or evaluation by tokenizing the text and creating attention masks.
-    String polarity labels are mapped to ids via LABEL_MAP; the input DataFrame is not modified.
+    Polarity labels may be text or integers (see api/labels.py); the input DataFrame is not modified.
 
     Args:
         df (pd.DataFrame): DataFrame containing the text data and labels.
         tokenizer (transformers.PreTrainedTokenizer): Tokenizer to use for encoding the text.
     """
-    labels = df['polarity'].astype(str).str.strip().str.lower().map(LABEL_MAP)
-    if labels.isna().any():
-        unknown = sorted(df.loc[labels.isna(), 'polarity'].astype(str).unique())
-        raise ValueError(f"Unknown polarity labels {unknown}; expected one of {list(LABEL_MAP)}")
-    labels = labels.astype('int64')
+    labels = [LABEL_IDS[name] for name in to_text_labels(df['polarity'])]
 
     enc = tokenizer(
         df['text'].fillna('').astype(str).tolist(),
@@ -72,7 +69,7 @@ def build_dataset(df, tokenizer):
     return TensorDataset(
         enc['input_ids'],
         enc['attention_mask'],
-        torch.tensor(labels.values)
+        torch.tensor(labels, dtype=torch.int64)
     )
 
 def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, model_name, history=None):
@@ -209,8 +206,68 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
             print(f"Best model saved at {model_save_path}")
 
     print("Best (Saved) Model Performance on Validation Set:")
-    print(classification_report(best_val_labels, best_val_predictions, digits=4, zero_division=0))
+    print(classification_report(
+        [LABELS[int(i)] for i in best_val_labels], [LABELS[int(i)] for i in best_val_predictions],
+        labels=LABEL_ORDER, digits=4, zero_division=0
+    ))
     return model_save_path
+
+def load_model(model_saved_path, model_task, model_tokenizer, model_name):
+    """
+    Loads a trained model and its tokenizer, ready for prediction.
+
+    Args:
+        model_saved_path (str): Path to the saved model.
+        model_task (class): Transformer model class, e.g., AutoModelForSequenceClassification
+        model_tokenizer (class): Tokenizer class, e.g., AutoTokenizer
+        model_name (str): Hugging Face model name, e.g., "bert-base-cased"
+
+    Returns:
+        tuple: (model, tokenizer)
+    """
+    tokenizer = model_tokenizer.from_pretrained(model_name, do_lower_case=True)
+
+    # Hide the "you should probably TRAIN this model" message while loading: it is about the
+    # untrained starting weights, which are replaced by the trained ones on the next line.
+    verbosity = transformers_logging.get_verbosity()
+    transformers_logging.set_verbosity_error()
+    model = model_task.from_pretrained(model_name, num_labels=len(LABELS), ignore_mismatched_sizes=True)
+    transformers_logging.set_verbosity(verbosity)
+
+    model.load_state_dict(torch.load(model_saved_path, map_location=device))
+    model.to(device)
+    model.eval()
+    return model, tokenizer
+
+def predict_labels(model, tokenizer, texts):
+    """
+    Predicts the sentiment of each text.
+
+    Args:
+        model: Model returned by load_model.
+        tokenizer: Tokenizer returned by load_model.
+        texts (iterable): Texts to classify. Missing values are treated as empty text.
+
+    Returns:
+        list[str]: "negative", "neutral" or "positive" for each text, in the same order.
+    """
+    texts = ["" if pd.isna(text) else str(text) for text in texts]
+
+    predictions = []
+    for start in range(0, len(texts), BATCH_SIZE):
+        enc = tokenizer(
+            texts[start:start + BATCH_SIZE],
+            truncation=True,
+            padding='max_length',
+            max_length=MAX_LEN,
+            return_tensors='pt',
+            return_attention_mask=True
+        )
+        with torch.no_grad():
+            outputs = model(enc['input_ids'].to(device), attention_mask=enc['attention_mask'].to(device))
+        predictions.extend(torch.argmax(outputs[0], dim=1).cpu().tolist())
+
+    return [LABELS[label_id] for label_id in predictions]
 
 def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model_name):
     """
@@ -230,34 +287,16 @@ def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model
     """
     seed_torch(42)
 
-    tokenizer = model_tokenizer.from_pretrained(model_name, do_lower_case=True)
-
-    # Tokenize the test data
-    test_data = build_dataset(test_df, tokenizer)
-    test_dataloader = DataLoader(test_data, sampler=SequentialSampler(test_data), batch_size=BATCH_SIZE)
-
-    # Load the model
-    model = model_task.from_pretrained(model_name, num_labels=3, ignore_mismatched_sizes=True)
-    model.load_state_dict(torch.load(model_saved_path, map_location=device))
-    model.to(device)
-    model.eval()
-
-    # Make predictions
-    predictions, true_labels = [], []
-    with torch.no_grad():
-        for batch in test_dataloader:
-            b_input_ids, b_input_mask, b_labels = [t.to(device) for t in batch]
-            outputs = model(b_input_ids, attention_mask=b_input_mask)
-            logits = outputs[0]
-            predictions.extend(torch.argmax(logits, axis=1).cpu().numpy())
-            true_labels.extend(b_labels.cpu().numpy())
+    model, tokenizer = load_model(model_saved_path, model_task, model_tokenizer, model_name)
+    true_labels = to_text_labels(test_df['polarity'])
+    predictions = predict_labels(model, tokenizer, test_df['text'])
 
     # Calculate metrics
     accuracy = accuracy_score(true_labels, predictions)
     precision = precision_score(true_labels, predictions, average='weighted', zero_division=0)
     recall = recall_score(true_labels, predictions, average='weighted', zero_division=0)
     f1 = f1_score(true_labels, predictions, average='weighted', zero_division=0)
-    conf_matrix = confusion_matrix(true_labels, predictions, labels=[0, 1, 2])
+    conf_matrix = confusion_matrix(true_labels, predictions, labels=LABEL_ORDER)
 
     # Print metrics
     print("Evaluation Metrics:")
@@ -265,14 +304,11 @@ def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"F1 Score: {f1:.4f}")
-    print("Confusion Matrix:")
-    print(conf_matrix)
+    print("Confusion Matrix (rows = true, columns = predicted):")
+    print(pd.DataFrame(conf_matrix, index=LABEL_ORDER, columns=LABEL_ORDER))
 
-    label_ids = [0, 1, 2]
-    label_names = ["neutral", "positive", "negative"]
     report = classification_report(
-        true_labels, predictions, labels=label_ids,
-        target_names=label_names, output_dict=True, zero_division=0
+        true_labels, predictions, labels=LABEL_ORDER, output_dict=True, zero_division=0
     )
     per_class = [
         {
@@ -282,7 +318,7 @@ def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model
             "f1": float(report[name]["f1-score"]),
             "support": int(report[name]["support"]),
         }
-        for name in label_names
+        for name in LABEL_ORDER
     ]
 
     return {
@@ -290,87 +326,37 @@ def evaluate_model(test_df, model_saved_path, model_task, model_tokenizer, model
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
-        "labels": label_names,
+        "labels": LABEL_ORDER,
         "confusion_matrix": conf_matrix.astype(int).tolist(),
         "per_class": per_class,
     }
 
 def predict_model(predict_df, model_saved_path, model_task, model_tokenizer, model_name):
     """
-    Uses a pre-trained transformer model (BERT, XLNet, RoBERTa, etc.) 
-    for sentiment classification and adds a polarity column in the test dataset 
-    with predicted values.
+    Uses a trained transformer model (BERT, XLNet, RoBERTa, etc.) for sentiment
+    classification and returns the data with a polarity column of text labels.
 
     Args:
-    - predict_df (pd.DataFrame): DataFrame containing text data to classify.
-    - model_saved_path (str): Path to the saved model.
-    - model_task (class): e.g., BertForSequenceClassification, XLNetForSequenceClassification
-    - model_tokenizer (class): e.g., BertTokenizer, XLNetTokenizer
-    - model_name (str): e.g., "bert-base-cased"
+        predict_df (pd.DataFrame): DataFrame with a 'text' column to classify. Not modified.
+        model_saved_path (str): Path to the saved model.
+        model_task (class): e.g., BertForSequenceClassification, XLNetForSequenceClassification
+        model_tokenizer (class): e.g., BertTokenizer, XLNetTokenizer
+        model_name (str): e.g., "bert-base-cased"
 
     Returns:
-    pd.DataFrame: Same DataFrame with a new 'polarity' column containing predicted labels.
+        pd.DataFrame: Copy of predict_df with a 'polarity' column containing "negative",
+        "neutral" or "positive".
     """
-    
     seed_torch(42)
 
-    tokenizer = model_tokenizer.from_pretrained(model_name, do_lower_case=True)
-
     begin = time.time()
-    sentences = predict_df.text.values
+    model, tokenizer = load_model(model_saved_path, model_task, model_tokenizer, model_name)
+    predictions = predict_labels(model, tokenizer, predict_df['text'])
+    print(f'Prediction used {time.time() - begin:.2f} seconds')
 
-    input_ids = []
-    attention_masks = []
-
-    for sent in sentences:
-        encoded_dict = tokenizer.encode_plus(
-            str(sent),
-            add_special_tokens=True,
-            max_length=MAX_LEN,
-            padding="max_length",
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        input_ids.append(encoded_dict['input_ids'])
-        attention_masks.append(encoded_dict['attention_mask'])
-
-    prediction_inputs = torch.cat(input_ids, dim=0)
-    prediction_masks = torch.cat(attention_masks, dim=0)
-
-    prediction_data = TensorDataset(prediction_inputs, prediction_masks)
-    prediction_sampler = SequentialSampler(prediction_data)
-    prediction_dataloader = DataLoader(
-        prediction_data, sampler=prediction_sampler, batch_size=BATCH_SIZE
-    )
-
-    # Instantiate model dynamically
-    model = model_task.from_pretrained(model_name, num_labels=3)
-    model.load_state_dict(torch.load(model_saved_path, map_location=device))
-    model.to(device)
-    model.eval()
-
-    predictions = []
-    for batch in prediction_dataloader:
-        batch = tuple(t.to(device) for t in batch)
-        b_input_ids, b_input_mask = batch
-
-        with torch.no_grad():
-            outputs = model(b_input_ids, token_type_ids=None, attention_mask=b_input_mask)
-            logits = outputs[0]
-
-        predictions.append(logits.detach().cpu().numpy())
-
-    end = time.time()
-    print(f'Prediction used {end - begin:.2f} seconds')
-
-    flat_predictions = [item for sublist in predictions for item in sublist]
-    flat_predictions = np.argmax(flat_predictions, axis=1).flatten()
-
-    # Add polarity column
-    predict_df['polarity'] = flat_predictions
-
-    return predict_df
+    result = predict_df.copy()
+    result['polarity'] = predictions
+    return result
 
 """
 def train_model(train_df, model_save_path, model_select=0):
