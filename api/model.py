@@ -97,47 +97,6 @@ def train_model(train_df, val_df, model_save_path, model_task, model_tokenizer, 
 
     train_dataloader = DataLoader(train_data, sampler=RandomSampler(train_data), batch_size=BATCH_SIZE)
     val_dataloader = DataLoader(val_data, sampler=SequentialSampler(val_data), batch_size=BATCH_SIZE)
-
-    """
-    sentences = train_df.text.values
-    labels = train_df.polarity.values
-
-    input_ids, attention_masks = [], []
-
-    for sent in sentences:
-        encoded_dict = tokenizer.encode_plus(
-            str(sent),
-            add_special_tokens=True,
-            max_length=MAX_LEN,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        input_ids.append(encoded_dict['input_ids'])
-        attention_masks.append(encoded_dict['attention_mask'])
-
-    input_ids = torch.cat(input_ids, dim=0)
-    attention_masks = torch.cat(attention_masks, dim=0)
-    labels = torch.tensor(labels)
-
-    print(f'Training data shape: {input_ids.shape}, {attention_masks.shape}, {labels.shape}')
-
-    train_inputs, val_inputs, train_labels, val_labels = train_test_split(
-        input_ids, labels, test_size=0.1, random_state=42
-    )
-    train_masks, val_masks, _, _ = train_test_split(
-        attention_masks, labels, test_size=0.1, random_state=42
-    )
-    
-    train_data = TensorDataset(train_inputs, train_masks, train_labels)
-    train_sampler = RandomSampler(train_data)
-    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=BATCH_SIZE)
-
-    val_data = TensorDataset(val_inputs, val_masks, val_labels)
-    val_sampler = SequentialSampler(val_data)
-    val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=BATCH_SIZE)
-    """
     
     # Use passed-in model_task and model_name
     model = model_task.from_pretrained(model_name, num_labels=3, ignore_mismatched_sizes=True)
